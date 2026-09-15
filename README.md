@@ -106,7 +106,13 @@ wails dev
 wails build
 ```
 
-**Prerequisites:** Go 1.23+, Node.js 18+, [Wails v2](https://wails.io), webkit2gtk, gtk-layer-shell, gstreamer, gst-plugins-good
+**Prerequisites:** Go 1.23+, Node.js 22.22.2+ or 24.15+ LTS, [Wails v2](https://wails.io), webkit2gtk, gtk-layer-shell, gstreamer, gst-plugins-good
+
+### Verification
+
+Run `make test` for the Go package tests. With the native build dependencies installed, `go test -race -tags webkit2_41 ./...` also covers the app entry points and enables Go's race detector (omit the tag on WebKitGTK 4.0 systems).
+
+From `frontend/`, run `npm ci`, `npm run check`, `npm test`, and `npm run build`. The frontend regression suite uses mocked Wails calls, so it does not change your desktop. Use `make dev` for manual verification of native dialogs, rendering, and theme application.
 
 ## Documentation
 

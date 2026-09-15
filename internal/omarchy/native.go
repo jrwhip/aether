@@ -1,7 +1,10 @@
 package omarchy
 
 import (
+	"crypto/sha256"
 	"fmt"
+	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -117,39 +120,127 @@ func ThemeExists(name string) bool {
 // wallpaper is supplied, Omarchy preserves the current background until the
 // requested image can be selected explicitly.
 func ActivateTheme(name, wallpaper string) error {
+	return ActivateThemeWithInstall(name, wallpaper, func(activate func() error) error {
+		return activate()
+	})
+}
+
+// ActivateThemeWithInstall snapshots the current background before installing a
+// generated bundle. install must call activate once after installation and roll
+// back the bundle before returning an activation error, so the old background's
+// original path can be reused when its contents match. Recovery snapshots remain
+// in Aether's data directory when selected. This does not serialize transactions.
+func ActivateThemeWithInstall(name, wallpaper string, install func(activate func() error) error) error {
 	if !IsInstalled() {
 		return fmt.Errorf("omarchy is not installed")
 	}
 	if err := validateThemeName(name); err != nil {
 		return err
 	}
-	if err := rememberPreviousTheme(name); err != nil {
-		return err
+	previousBackground := currentBackgroundPath()
+	snapshot := ""
+	var previousDigest [sha256.Size]byte
+	previousInRuntime := true
+	keepSnapshot := false
+	if previousBackground != "" {
+		info, err := os.Stat(previousBackground)
+		if err != nil {
+			return fmt.Errorf("inspect previous background: %w", err)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("previous background is not a regular file: %s", previousBackground)
+		}
+		// Omarchy replaces copied runtime themes, so even an existing path can
+		// name different bytes after failure. Keep recovery media outside it.
+		recoveryRoot := filepath.Join(platform.DataDir(), "background-recovery")
+		if err := os.MkdirAll(recoveryRoot, 0o700); err != nil {
+			return fmt.Errorf("create background recovery directory: %w", err)
+		}
+		recoveryDir, err := os.MkdirTemp(recoveryRoot, "background-")
+		if err != nil {
+			return fmt.Errorf("reserve previous background snapshot: %w", err)
+		}
+		defer func() {
+			if !keepSnapshot {
+				if err := os.RemoveAll(recoveryDir); err != nil {
+					log.Printf("Warning: could not remove background snapshot %s: %v", recoveryDir, err)
+				}
+			}
+		}()
+		snapshot = filepath.Join(recoveryDir, filepath.Base(previousBackground))
+		if err := platform.CopyFile(previousBackground, snapshot); err != nil {
+			return fmt.Errorf("snapshot previous background %q: %w", previousBackground, err)
+		}
+		previousDigest, err = backgroundDigest(snapshot)
+		if err != nil {
+			return fmt.Errorf("verify previous background snapshot: %w", err)
+		}
+		if runtimeDir, err := filepath.EvalSymlinks(CurrentStateDir()); err == nil {
+			if relative, err := filepath.Rel(runtimeDir, previousBackground); err == nil {
+				previousInRuntime = filepath.IsLocal(relative)
+			}
+		}
 	}
+	activationStarted := false
+	err := install(func() error {
+		if err := rememberPreviousTheme(name); err != nil {
+			return err
+		}
+		activationStarted = true
+		if wallpaper == "" {
+			if _, err := platform.RunSync("omarchy", "theme", "set", name); err != nil {
+				return fmt.Errorf("activate Omarchy theme %q: %w", name, err)
+			}
+			return nil
+		}
 
-	if wallpaper == "" {
-		if _, err := platform.RunSync("omarchy", "theme", "set", name); err != nil {
+		if _, err := platform.RunSync("omarchy", "theme", "bg", "set", wallpaper); err != nil {
+			return fmt.Errorf("set Omarchy background: %w", err)
+		}
+		if _, err := platform.RunSyncEnv(
+			map[string]string{"OMARCHY_THEME_SKIP_BACKGROUND": "1"},
+			"omarchy", "theme", "set", name,
+		); err != nil {
 			return fmt.Errorf("activate Omarchy theme %q: %w", name, err)
 		}
 		return nil
-	}
-
-	previousBackground := currentBackgroundPath()
-	if _, err := platform.RunSync("omarchy", "theme", "bg", "set", wallpaper); err != nil {
-		return fmt.Errorf("set Omarchy background: %w", err)
-	}
-	if _, err := platform.RunSyncEnv(
-		map[string]string{"OMARCHY_THEME_SKIP_BACKGROUND": "1"},
-		"omarchy", "theme", "set", name,
-	); err != nil {
-		if previousBackground != "" {
-			if _, restoreErr := platform.RunSync("omarchy", "theme", "bg", "set", previousBackground); restoreErr != nil {
-				return fmt.Errorf("activate Omarchy theme %q: %w; restore previous background: %v", name, err, restoreErr)
+	})
+	if err != nil && activationStarted && previousBackground != "" {
+		restorePath := snapshot
+		if !previousInRuntime {
+			if digest, readErr := backgroundDigest(previousBackground); readErr == nil && digest == previousDigest {
+				restorePath = previousBackground
 			}
 		}
-		return fmt.Errorf("activate Omarchy theme %q: %w", name, err)
+		keepSnapshot = restorePath == snapshot
+		if _, restoreErr := platform.RunSync("omarchy", "theme", "bg", "set", restorePath); restoreErr != nil {
+			keepSnapshot = true
+			return fmt.Errorf("%w; restore previous background: %v; recovery copy: %s", err, restoreErr, snapshot)
+		}
 	}
-	return nil
+	return err
+}
+
+func backgroundDigest(path string) ([sha256.Size]byte, error) {
+	var digest [sha256.Size]byte
+	info, err := os.Stat(path)
+	if err != nil {
+		return digest, err
+	}
+	if !info.Mode().IsRegular() {
+		return digest, fmt.Errorf("background is not a regular file: %s", path)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return digest, err
+	}
+	defer file.Close()
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return digest, err
+	}
+	copy(digest[:], hash.Sum(nil))
+	return digest, nil
 }
 
 func currentBackgroundPath() string {

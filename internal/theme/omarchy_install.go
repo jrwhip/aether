@@ -32,13 +32,8 @@ func (w *Writer) InstallOmarchyTheme(state *ThemeState, settings Settings, name 
 	}
 
 	targetDir := filepath.Join(omarchy.UserThemesDir(), name)
-	wallpaper, err := w.generateOmarchyTheme(state, settings, targetDir)
-	if err != nil {
-		return fmt.Errorf("generate Omarchy theme %q: %w", name, err)
-	}
-
-	if err := omarchy.ActivateTheme(name, wallpaper); err != nil {
-		return fmt.Errorf("activate Omarchy theme %q: %w", name, err)
+	if err := w.generateOmarchyTheme(state, settings, targetDir, name); err != nil {
+		return fmt.Errorf("install Omarchy theme %q: %w", name, err)
 	}
 	return nil
 }

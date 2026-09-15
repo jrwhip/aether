@@ -142,44 +142,79 @@ func NewWriter(fsys embed.FS, dir string) *Writer {
 	}
 }
 
-// prepareThemeDir creates the theme directory, cleans the backgrounds subdir,
-// and copies wallpaper + additional images. Returns the wallpaper destination path.
+// prepareThemeDir stages all media before replacing the backgrounds subdir.
+// Returns the wallpaper destination path.
 // If no wallpaper or additional images are provided, existing backgrounds are preserved.
 func prepareThemeDir(targetDir string, state *ThemeState) (string, error) {
 	bgDir := filepath.Join(targetDir, "backgrounds")
 	if err := platform.EnsureDir(bgDir); err != nil {
-		return "", err
+		return "", fmt.Errorf("create theme backgrounds directory: %w", err)
 	}
 	// Remove Aether-owned output left by versions that supported GTK styling.
 	if err := removeLegacyGTKStylesheet(filepath.Join(targetDir, "gtk.css")); err != nil {
 		return "", err
 	}
 
-	// Only clean backgrounds when we have new content to replace them with.
-	// This preserves the current wallpaper when applying color-only blueprints.
-	hasNewBackgrounds := state.WallpaperPath != "" || len(state.AdditionalImages) > 0
-	if hasNewBackgrounds {
-		if err := platform.CleanDir(bgDir); err != nil {
-			return "", err
+	if state.WallpaperPath == "" && len(state.AdditionalImages) == 0 {
+		return "", nil
+	}
+
+	mediaDir, err := os.MkdirTemp(targetDir, ".backgrounds-")
+	if err != nil {
+		return "", fmt.Errorf("stage theme backgrounds: %w", err)
+	}
+	cleanup := true
+	defer func() {
+		if cleanup {
+			if err := os.RemoveAll(mediaDir); err != nil {
+				log.Printf("Warning: could not remove background staging directory %s: %v", mediaDir, err)
+			}
 		}
+	}()
+	staging := filepath.Join(mediaDir, "backgrounds")
+	if err := platform.EnsureDir(staging); err != nil {
+		return "", fmt.Errorf("stage theme backgrounds: %w", err)
+	}
+
+	// Sources may be inside the live backgrounds directory, including symlinks.
+	sources := append([]string{state.WallpaperPath}, state.AdditionalImages...)
+	seen := make(map[string]string, len(sources))
+	for i, src := range sources {
+		if i == 0 && src == "" {
+			continue
+		}
+		name := filepath.Base(src)
+		if previous, ok := seen[name]; ok {
+			return "", fmt.Errorf("background basename collision %q: %q and %q", name, previous, src)
+		}
+		seen[name] = src
+		if err := platform.CopyFile(src, filepath.Join(staging, name)); err != nil {
+			if i == 0 {
+				return "", fmt.Errorf("copy wallpaper %q: %w", src, err)
+			}
+			return "", fmt.Errorf("copy additional image %d %q: %w", i, src, err)
+		}
+	}
+	if err := preserveThemeMedia(targetDir, mediaDir, false); err != nil {
+		return "", err
+	}
+
+	backup := filepath.Join(mediaDir, "previous")
+	if err := os.Rename(bgDir, backup); err != nil {
+		return "", fmt.Errorf("backup theme backgrounds: %w", err)
+	}
+	if err := os.Rename(staging, bgDir); err != nil {
+		if restoreErr := os.Rename(backup, bgDir); restoreErr != nil {
+			cleanup = false // Keep the only remaining copy available for recovery.
+			return "", fmt.Errorf("install theme backgrounds: %w; restore backgrounds from %s: %v", err, backup, restoreErr)
+		}
+		return "", fmt.Errorf("install theme backgrounds: %w", err)
 	}
 
 	wallpaperDest := ""
 	if state.WallpaperPath != "" {
-		destPath := filepath.Join(bgDir, filepath.Base(state.WallpaperPath))
-		if err := platform.CopyFile(state.WallpaperPath, destPath); err != nil {
-			return "", fmt.Errorf("copy wallpaper: %w", err)
-		}
-		wallpaperDest = destPath
+		wallpaperDest = filepath.Join(bgDir, filepath.Base(state.WallpaperPath))
 	}
-
-	for i, src := range state.AdditionalImages {
-		destPath := filepath.Join(bgDir, filepath.Base(src))
-		if err := platform.CopyFile(src, destPath); err != nil {
-			return "", fmt.Errorf("copy additional image %d: %w", i+1, err)
-		}
-	}
-
 	return wallpaperDest, nil
 }
 
@@ -190,17 +225,18 @@ func (w *Writer) applyEditorThemes(
 	appOverrides map[string]map[string]string,
 	includeZed bool,
 	includeVscode bool,
-) {
+) error {
 	if includeZed || len(appOverrides["zed"]) > 0 {
 		if err := ApplyZedTheme(themeDir); err != nil {
-			log.Printf("Warning: Zed theme application failed: %v", err)
+			return fmt.Errorf("apply Zed theme: %w", err)
 		}
 	}
 	if includeVscode || len(appOverrides["vscode"]) > 0 {
 		if err := ApplyVSCodeTheme(w.templatesFS, w.templatesDir, variables); err != nil {
-			log.Printf("Warning: VSCode theme application failed: %v", err)
+			return fmt.Errorf("apply VSCode theme: %w", err)
 		}
 	}
+	return nil
 }
 
 // processOmarchyV4Templates renders the files Omarchy v4 reads directly from
@@ -267,69 +303,69 @@ func (w *Writer) processOmarchyV4Templates(
 // GenerateOmarchyV4Only atomically writes an Aether-managed native Omarchy
 // theme. Existing foreign themes are never overwritten.
 func (w *Writer) GenerateOmarchyV4Only(state *ThemeState, settings Settings, outputPath string) error {
-	_, err := w.generateOmarchyTheme(state, settings, outputPath)
-	return err
+	return w.generateOmarchyTheme(state, settings, outputPath, "")
 }
 
-func (w *Writer) generateOmarchyTheme(state *ThemeState, settings Settings, outputPath string) (string, error) {
+func (w *Writer) generateOmarchyTheme(state *ThemeState, settings Settings, outputPath, activateName string) error {
 	variables := template.BuildVariables(state.ColorRoles, state.LightMode, state.ExtendedColors)
 	if err := validateTemplateInputs(variables, state.AppOverrides); err != nil {
-		return "", err
+		return err
 	}
 	if err := omarchy.ValidateNativeColors(state.NativeColors); err != nil {
-		return "", err
+		return err
 	}
 	for app, overrides := range state.AppOverrides {
 		if len(overrides) > 0 && !omarchy.SupportsThemeOverride(app) {
-			return "", fmt.Errorf("%s overrides are not supported by native Omarchy themes", app)
+			return fmt.Errorf("%s overrides are not supported by native Omarchy themes", app)
 		}
 	}
 
 	parent := filepath.Dir(outputPath)
 	if err := platform.EnsureDir(parent); err != nil {
-		return "", err
+		return fmt.Errorf("create Omarchy themes directory: %w", err)
 	}
 	if err := ensureReplaceableTheme(outputPath); err != nil {
-		return "", err
+		return err
 	}
 
 	staging, err := os.MkdirTemp(parent, "."+filepath.Base(outputPath)+".aether-")
 	if err != nil {
-		return "", fmt.Errorf("create Omarchy theme staging directory: %w", err)
+		return fmt.Errorf("create Omarchy theme staging directory: %w", err)
 	}
 	defer os.RemoveAll(staging)
 
-	if state.WallpaperPath == "" && len(state.AdditionalImages) == 0 {
-		if err := preserveThemeMedia(outputPath, staging); err != nil {
-			return "", err
-		}
-	}
 	wallpaperPath, err := prepareThemeDir(staging, state)
 	if err != nil {
-		return "", err
+		return err
+	}
+	if err := preserveThemeMedia(outputPath, staging, state.WallpaperPath == "" && len(state.AdditionalImages) == 0); err != nil {
+		return err
 	}
 	if err := w.processOmarchyV4Templates(staging, variables, settings, state.AppOverrides, state.ExtendedColors); err != nil {
-		return "", err
+		return err
 	}
 	if err := appendNativeColors(filepath.Join(staging, "colors.toml"), state.NativeColors); err != nil {
-		return "", err
+		return err
 	}
 	if wallpaperPath != "" {
 		if err := writeThemePreview(staging, wallpaperPath); err != nil {
-			return "", err
+			return err
 		}
 	}
 	if err := omarchy.MarkManagedTheme(staging); err != nil {
-		return "", fmt.Errorf("mark Omarchy theme as Aether-managed: %w", err)
+		return fmt.Errorf("mark Omarchy theme as Aether-managed: %w", err)
 	}
-	if err := replaceThemeDir(staging, outputPath); err != nil {
-		return "", err
+	if activateName == "" {
+		return replaceThemeDir(staging, outputPath, nil)
 	}
 
-	if wallpaperPath == "" {
-		return "", nil
+	wallpaperDest := ""
+	if wallpaperPath != "" {
+		wallpaperDest = filepath.Join(outputPath, "backgrounds", filepath.Base(wallpaperPath))
 	}
-	return filepath.Join(outputPath, "backgrounds", filepath.Base(wallpaperPath)), nil
+	return omarchy.ActivateThemeWithInstall(activateName, wallpaperDest, func(activate func() error) error {
+		return replaceThemeDir(staging, outputPath, activate)
+	})
 }
 
 // ApplyTheme generates all theme files and applies the theme to the system.
@@ -345,11 +381,7 @@ func (w *Writer) ApplyTheme(state *ThemeState, settings Settings) (*ApplyResult,
 	isOmarchy := IsOmarchyInstalled()
 	if isOmarchy {
 		themeDir := platform.OmarchyThemeDir()
-		wallpaperDest, err := w.generateOmarchyTheme(state, settings, themeDir)
-		if err != nil {
-			return &ApplyResult{Success: false, IsOmarchy: true, ThemePath: themeDir}, err
-		}
-		if err := omarchy.ActivateTheme("aether", wallpaperDest); err != nil {
+		if err := w.generateOmarchyTheme(state, settings, themeDir, "aether"); err != nil {
 			return &ApplyResult{Success: false, IsOmarchy: true, ThemePath: themeDir}, err
 		}
 		return &ApplyResult{Success: true, IsOmarchy: true, ThemePath: themeDir}, nil
@@ -359,19 +391,23 @@ func (w *Writer) ApplyTheme(state *ThemeState, settings Settings) (*ApplyResult,
 	if _, err := prepareThemeDir(themeDir, state); err != nil {
 		return &ApplyResult{Success: false, ThemePath: themeDir}, err
 	}
-	w.processTemplates(variables, themeDir, settings, state.AppOverrides, state.ExtendedColors)
-	w.applyEditorThemes(
+	if err := w.processTemplates(variables, themeDir, settings, state.AppOverrides, state.ExtendedColors); err != nil {
+		return &ApplyResult{Success: false, ThemePath: themeDir}, err
+	}
+	if err := HandleLightModeMarker(themeDir, state.LightMode); err != nil {
+		return &ApplyResult{Success: false, ThemePath: themeDir}, fmt.Errorf("update light mode marker: %w", err)
+	}
+	if err := w.applyEditorThemes(
 		themeDir,
 		variables,
 		state.AppOverrides,
 		settings.includesApp("zed"),
 		settings.includesApp("vscode"),
-	)
-	if err := HandleLightModeMarker(themeDir, state.LightMode); err != nil {
-		log.Printf("Warning: light mode marker failed: %v", err)
+	); err != nil {
+		return &ApplyResult{Success: false, ThemePath: themeDir}, err
 	}
 	if err := template.ProcessCustomApps(themeDir, variables); err != nil {
-		log.Printf("Warning: custom app processing failed: %v", err)
+		return &ApplyResult{Success: false, ThemePath: themeDir}, fmt.Errorf("process custom apps: %w", err)
 	}
 	return &ApplyResult{Success: true, ThemePath: themeDir}, nil
 }
@@ -388,27 +424,29 @@ func (w *Writer) GenerateOnly(state *ThemeState, settings Settings, outputPath s
 		targetDir = platform.ThemeDir()
 	}
 	if err := platform.EnsureDir(targetDir); err != nil {
-		return err
+		return fmt.Errorf("create theme output directory: %w", err)
 	}
 
 	if _, err := prepareThemeDir(targetDir, state); err != nil {
 		return err
 	}
 
-	w.processTemplates(variables, targetDir, settings, state.AppOverrides, state.ExtendedColors)
+	if err := w.processTemplates(variables, targetDir, settings, state.AppOverrides, state.ExtendedColors); err != nil {
+		return err
+	}
 
 	// Generate VSCode extension into the export directory
 	vscodeDir := filepath.Join(targetDir, "vscode-extension")
 	if settings.includesApp("vscode") || len(state.AppOverrides["vscode"]) > 0 {
 		if err := processVSCodeExtension(w.templatesFS, w.templatesDir, vscodeDir, variables); err != nil {
-			log.Printf("Warning: VSCode extension export failed: %v", err)
+			return fmt.Errorf("export VSCode extension: %w", err)
 		}
 	} else if err := os.RemoveAll(vscodeDir); err != nil {
-		log.Printf("Warning: stale VSCode extension cleanup failed: %v", err)
+		return fmt.Errorf("remove stale VSCode extension: %w", err)
 	}
 
 	if err := HandleLightModeMarker(targetDir, state.LightMode); err != nil {
-		log.Printf("Warning: light mode marker failed: %v", err)
+		return fmt.Errorf("update light mode marker: %w", err)
 	}
 
 	log.Printf("Theme files generated to: %s", targetDir)
@@ -465,12 +503,14 @@ func ensureReplaceableTheme(path string) error {
 	return fmt.Errorf("refusing to replace unmanaged Omarchy theme %q", filepath.Base(path))
 }
 
-func preserveThemeMedia(existing, staging string) error {
+// Subdirectories are user content, not flat generated backgrounds. Preserve
+// them even when replacing media, without changing the old tree during staging.
+func preserveThemeMedia(existing, staging string, preserveFiles bool) error {
 	if _, err := os.Stat(existing); err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
-		return fmt.Errorf("inspect existing Omarchy theme: %w", err)
+		return fmt.Errorf("inspect existing theme: %w", err)
 	}
 
 	sourceBackgrounds := filepath.Join(existing, "backgrounds")
@@ -481,18 +521,26 @@ func preserveThemeMedia(existing, staging string) error {
 			return err
 		}
 		for _, entry := range entries {
+			source := filepath.Join(sourceBackgrounds, entry.Name())
+			target := filepath.Join(targetBackgrounds, entry.Name())
 			if entry.IsDir() {
+				if err := copyBackgroundDir(source, target); err != nil {
+					return fmt.Errorf("preserve background directory %q: %w", entry.Name(), err)
+				}
 				continue
 			}
-			if err := platform.CopyFile(
-				filepath.Join(sourceBackgrounds, entry.Name()),
-				filepath.Join(targetBackgrounds, entry.Name()),
-			); err != nil {
+			if !preserveFiles {
+				continue
+			}
+			if err := platform.CopyFile(source, target); err != nil {
 				return fmt.Errorf("preserve Omarchy background %q: %w", entry.Name(), err)
 			}
 		}
 	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("read existing Omarchy backgrounds: %w", err)
+		return fmt.Errorf("read existing backgrounds: %w", err)
+	}
+	if !preserveFiles {
+		return nil
 	}
 
 	for _, name := range []string{"preview.png", "preview.jpg", "preview.jpeg", "preview.webp", "preview.gif", "preview.bmp"} {
@@ -506,6 +554,44 @@ func preserveThemeMedia(existing, staging string) error {
 		break
 	}
 	return nil
+}
+
+func copyBackgroundDir(source, target string) error {
+	info, err := os.Lstat(source)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("background directory changed during staging: %s", source)
+	}
+	if err := os.Mkdir(target, 0o700); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(source)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		src, dst := filepath.Join(source, entry.Name()), filepath.Join(target, entry.Name())
+		switch {
+		case entry.IsDir():
+			err = copyBackgroundDir(src, dst)
+		case entry.Type()&os.ModeSymlink != 0:
+			var link string
+			link, err = os.Readlink(src)
+			if err == nil {
+				err = os.Symlink(link, dst)
+			}
+		case entry.Type().IsRegular():
+			err = platform.CopyFile(src, dst)
+		default:
+			err = fmt.Errorf("cannot preserve non-regular background entry: %s", src)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return os.Chmod(target, info.Mode())
 }
 
 func appendNativeColors(colorsPath string, native map[string]string) error {
@@ -552,40 +638,50 @@ func writeThemePreview(themeDir, wallpaper string) error {
 	return nil
 }
 
-func replaceThemeDir(staging, target string) error {
-	if _, err := os.Lstat(target); os.IsNotExist(err) {
-		if err := os.Rename(staging, target); err != nil {
-			return fmt.Errorf("install Omarchy theme: %w", err)
-		}
-		return nil
-	} else if err != nil {
-		return fmt.Errorf("inspect Omarchy theme target: %w", err)
-	}
-
-	backup, err := os.MkdirTemp(filepath.Dir(target), "."+filepath.Base(target)+".backup-")
-	if err != nil {
-		return fmt.Errorf("reserve Omarchy theme backup: %w", err)
-	}
-	if err := os.Remove(backup); err != nil {
-		return fmt.Errorf("prepare Omarchy theme backup: %w", err)
-	}
-	if err := os.Rename(target, backup); err != nil {
-		return fmt.Errorf("backup Omarchy theme: %w", err)
-	}
+// replaceThemeDir keeps the backup until activation succeeds. On failure the
+// bundle is restored before the caller restores Omarchy's background selection.
+func replaceThemeDir(staging, target string, activate func() error) error {
+	backup := ""
 	restore := func(cause error) error {
-		if err := os.Rename(backup, target); err != nil {
-			return fmt.Errorf("%w; restore backup from %s: %v", cause, backup, err)
+		if backup != "" {
+			if err := os.Rename(backup, target); err != nil {
+				return fmt.Errorf("%w; restore backup from %s: %v", cause, backup, err)
+			}
 		}
 		return cause
 	}
-	if err := ensureReplaceableTheme(backup); err != nil {
-		return restore(fmt.Errorf("Omarchy theme changed during generation: %w", err))
+	if _, err := os.Lstat(target); err == nil {
+		backup, err = os.MkdirTemp(filepath.Dir(target), "."+filepath.Base(target)+".backup-")
+		if err != nil {
+			return fmt.Errorf("reserve Omarchy theme backup: %w", err)
+		}
+		if err := os.Remove(backup); err != nil {
+			return fmt.Errorf("prepare Omarchy theme backup: %w", err)
+		}
+		if err := os.Rename(target, backup); err != nil {
+			return fmt.Errorf("backup Omarchy theme: %w", err)
+		}
+		if err := ensureReplaceableTheme(backup); err != nil {
+			return restore(fmt.Errorf("Omarchy theme changed during generation: %w", err))
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("inspect Omarchy theme target: %w", err)
 	}
 	if err := os.Rename(staging, target); err != nil {
 		return restore(fmt.Errorf("install Omarchy theme: %w", err))
 	}
-	if err := os.RemoveAll(backup); err != nil {
-		log.Printf("Warning: could not remove Omarchy theme backup: %v", err)
+	if activate != nil {
+		if err := activate(); err != nil {
+			if rollbackErr := os.Rename(target, staging); rollbackErr != nil {
+				return fmt.Errorf("%w; move failed Omarchy theme aside (backup at %s): %v", err, backup, rollbackErr)
+			}
+			return restore(err)
+		}
+	}
+	if backup != "" {
+		if err := os.RemoveAll(backup); err != nil {
+			log.Printf("Warning: could not remove Omarchy theme backup %s: %v", backup, err)
+		}
 	}
 	return nil
 }
@@ -599,11 +695,10 @@ func (w *Writer) processTemplates(
 	settings Settings,
 	appOverrides map[string]map[string]string,
 	globalOverrides map[string]string,
-) {
+) error {
 	names, err := template.ListTemplates(w.templatesFS, w.templatesDir)
 	if err != nil {
-		log.Printf("Error listing templates: %v", err)
-		return
+		return fmt.Errorf("list templates: %w", err)
 	}
 
 	for _, fileName := range names {
@@ -616,7 +711,7 @@ func (w *Writer) processTemplates(
 		appName := getAppNameFromFileName(fileName)
 		if appName != "colors" && !settings.includesApp(appName) && len(appOverrides[appName]) == 0 {
 			if err := os.Remove(outputPath); err != nil && !os.IsNotExist(err) {
-				log.Printf("Error removing stale template %s: %v", fileName, err)
+				return fmt.Errorf("remove stale template %s: %w", fileName, err)
 			}
 			continue
 		}
@@ -624,7 +719,7 @@ func (w *Writer) processTemplates(
 		// Handle neovim.lua with custom config selection
 		if fileName == "neovim.lua" && settings.SelectedNeovimConfig != "" && len(appOverrides[appName]) == 0 {
 			if err := platform.WriteText(outputPath, settings.SelectedNeovimConfig); err != nil {
-				log.Printf("Error writing custom neovim.lua: %v", err)
+				return fmt.Errorf("write custom neovim.lua: %w", err)
 			} else {
 				log.Printf("Applied selected Neovim theme to %s", outputPath)
 			}
@@ -632,9 +727,10 @@ func (w *Writer) processTemplates(
 		}
 
 		if err := w.processTemplate(fileName, outputPath, variables, appOverrides, globalOverrides); err != nil {
-			log.Printf("Error processing template %s: %v", fileName, err)
+			return err
 		}
 	}
+	return nil
 }
 
 // processTemplate reads a single template, applies variable substitution

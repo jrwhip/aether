@@ -24,12 +24,14 @@
     import {getIsApplying} from '$lib/stores/theme.svelte';
     import {
         getFavorites,
+        getFavoritesError,
         refreshFavorites,
         toggleFavorite,
         type Favorite,
     } from '$lib/stores/favorites.svelte';
 
     let favorites = $derived(getFavorites());
+    let loadError = $derived(getFavoritesError());
     let isLoading = $state(true);
     let filterTag = $state<string>('');
     let previewIndex = $state(-1);
@@ -197,9 +199,22 @@
     </ViewHeader>
 
     <div class="flex-1 overflow-y-auto p-3">
+        {#if loadError}
+            <div
+                class="border-border bg-bg-surface text-fg-primary mb-3 flex items-center justify-between gap-3 border p-3 text-xs"
+                role="alert"
+            >
+                <span>{loadError}</span>
+                <button
+                    class="text-accent shrink-0 px-2 py-1"
+                    onclick={loadFavorites}
+                    disabled={isLoading}>Retry</button
+                >
+            </div>
+        {/if}
         {#if isLoading}
             <LoadingState message="Loading favorites…" />
-        {:else if filtered.length === 0}
+        {:else if filtered.length === 0 && !loadError}
             {#if filterTag}
                 <EmptyState
                     title="No favorites with this label"

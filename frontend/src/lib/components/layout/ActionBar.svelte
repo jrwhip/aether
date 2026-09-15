@@ -13,20 +13,10 @@
         getNativeColors,
         setNativeColors,
         getAppOverrides,
-        getAdjustments,
-        setAdjustments,
-        setAdjustedExtendedColors,
         isDirty,
         reset as resetTheme,
     } from '$lib/stores/theme.svelte';
-    import {
-        getCanUndo,
-        getCanRedo,
-        undo,
-        redo,
-        pushRedo,
-        pushUndo,
-    } from '$lib/stores/history.svelte';
+    import {getCanUndo, getCanRedo} from '$lib/stores/history.svelte';
     import {getSettings} from '$lib/stores/settings.svelte';
     import {
         getActiveTab,
@@ -44,6 +34,8 @@
         getNativeAppOverrides,
         requestThemeApply,
         saveThemeAsNew,
+        undoAction,
+        redoAction,
     } from '$lib/actions/themeActions';
     import SaveDialog from '$lib/components/blueprints/SaveDialog.svelte';
     import ConfirmDialog from '$lib/components/shared/ConfirmDialog.svelte';
@@ -161,26 +153,6 @@
     // --- Editor actions ---
 
     const handleApply = requestThemeApply;
-
-    function handleUndo() {
-        const snapshot = undo();
-        if (snapshot) {
-            pushRedo(getPalette(), getExtendedColors(), getAdjustments());
-            setPalette(snapshot.palette, true);
-            setAdjustedExtendedColors(snapshot.extendedColors);
-            setAdjustments(snapshot.adjustments);
-        }
-    }
-
-    function handleRedo() {
-        const snapshot = redo();
-        if (snapshot) {
-            pushUndo(getPalette(), getExtendedColors(), getAdjustments());
-            setPalette(snapshot.palette, true);
-            setAdjustedExtendedColors(snapshot.extendedColors);
-            setAdjustments(snapshot.adjustments);
-        }
-    }
 
     async function handleClear() {
         try {
@@ -370,13 +342,13 @@
 
                 <button
                     class="text-fg-dimmed hover:text-fg-secondary hover:bg-bg-hover px-2 py-1 text-[11px] transition-colors duration-100 disabled:cursor-default disabled:opacity-25"
-                    onclick={handleUndo}
+                    onclick={undoAction}
                     disabled={!undoEnabled}
                     title="Undo (Ctrl+Z)">Undo</button
                 >
                 <button
                     class="text-fg-dimmed hover:text-fg-secondary hover:bg-bg-hover px-2 py-1 text-[11px] transition-colors duration-100 disabled:cursor-default disabled:opacity-25"
-                    onclick={handleRedo}
+                    onclick={redoAction}
                     disabled={!redoEnabled}
                     title="Redo (Ctrl+Shift+Z)">Redo</button
                 >

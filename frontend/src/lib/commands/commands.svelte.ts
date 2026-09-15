@@ -7,8 +7,13 @@ import {
     getWallpaperPath,
     getLightMode,
     setLightMode,
-    setAdjustments,
+    getIsApplying,
+    getBasePalette,
+    getBaseExtendedColors,
+    getHistorySnapshot,
+    restoreHistorySnapshot,
 } from '$lib/stores/theme.svelte';
+import {getCanUndo, getCanRedo, pushState} from '$lib/stores/history.svelte';
 import {DEFAULT_ADJUSTMENTS} from '$lib/types/theme';
 import {zoomIn, zoomOut, resetZoom} from '$lib/utils/zoom';
 import {
@@ -17,6 +22,7 @@ import {
     redoAction,
     changeWallpaper,
     extractColors,
+    saveThemeAsNew,
 } from '$lib/actions/themeActions';
 import {getOmarchyAvailable} from '$lib/stores/omarchy.svelte';
 
@@ -28,6 +34,8 @@ export type Command = {
     keywords?: string;
     run: () => void | Promise<void>;
     visible?: () => boolean;
+    disabled?: () => string | undefined;
+    colors?: string[];
 };
 
 const hasWallpaper = () => !!getWallpaperPath();
@@ -91,6 +99,18 @@ export function buildCommands(): Command[] {
             shortcut: 'Ctrl+Enter',
             keywords: 'publish install',
             run: applyTheme,
+            disabled: () =>
+                getIsApplying() ? 'A theme is being applied' : undefined,
+        },
+        {
+            id: 'theme.saveAs',
+            label: 'Save and apply as new theme...',
+            category: 'Theme',
+            shortcut: 'Ctrl+J',
+            keywords: 'name folder publish install',
+            run: saveThemeAsNew,
+            disabled: () =>
+                getIsApplying() ? 'A theme is being applied' : undefined,
         },
         {
             id: 'theme.toggleLight',
@@ -104,7 +124,18 @@ export function buildCommands(): Command[] {
             label: 'Reset palette adjustments',
             category: 'Theme',
             keywords: 'revert sliders',
-            run: () => setAdjustments({...DEFAULT_ADJUSTMENTS}),
+            run: () => {
+                const snapshot = getHistorySnapshot();
+                pushState(snapshot);
+                restoreHistorySnapshot({
+                    ...snapshot,
+                    palette: [...getBasePalette()],
+                    extendedColors: {...getBaseExtendedColors()},
+                    adjustments: {...DEFAULT_ADJUSTMENTS},
+                    paletteCurvePoints: [],
+                    pendingAdjustment: null,
+                });
+            },
         },
 
         {
@@ -113,6 +144,7 @@ export function buildCommands(): Command[] {
             category: 'Edit',
             shortcut: 'Ctrl+Z',
             run: undoAction,
+            disabled: () => (getCanUndo() ? undefined : 'Nothing to undo'),
         },
         {
             id: 'edit.redo',
@@ -120,6 +152,7 @@ export function buildCommands(): Command[] {
             category: 'Edit',
             shortcut: 'Ctrl+Shift+Z',
             run: redoAction,
+            disabled: () => (getCanRedo() ? undefined : 'Nothing to redo'),
         },
 
         {

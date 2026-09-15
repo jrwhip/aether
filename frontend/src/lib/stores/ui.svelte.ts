@@ -22,6 +22,7 @@ let toastMessage = $state<string>('');
 let toastVisible = $state<boolean>(false);
 let toastAction = $state<ToastAction | null>(null);
 let liveApply = $state<boolean>(readBoolPref(STORAGE_KEYS.liveApply, false));
+let liveApplySession = $state(0);
 let livePending = $state<boolean>(false);
 let targetsVisible = $state<boolean>(
     readBoolPref(STORAGE_KEYS.targetsVisible, true)
@@ -174,7 +175,14 @@ export function getToastQueueDepth(): number {
 export function getLiveApply(): boolean {
     return liveApply;
 }
+export function getLiveApplySession(): number {
+    return liveApplySession;
+}
+export function invalidateLiveApplySession(): void {
+    liveApplySession++;
+}
 export function setLiveApply(v: boolean): void {
+    if (v !== liveApply) invalidateLiveApplySession();
     liveApply = v;
     writeBoolPref(STORAGE_KEYS.liveApply, v);
     if (!v) livePending = false;

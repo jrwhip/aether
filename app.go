@@ -466,6 +466,8 @@ func (a *App) ListBlueprints() ([]map[string]interface{}, error) {
 				"colors":           bp.Palette.Colors,
 				"wallpaper":        bp.Palette.Wallpaper,
 				"lightMode":        bp.Palette.LightMode,
+				"mode":             bp.Palette.Mode,
+				"lockedColors":     bp.Palette.LockedColors,
 				"extendedColors":   bp.Palette.ExtendedColors,
 				"nativeColors":     bp.Palette.NativeColors,
 				"additionalImages": bp.Palette.AdditionalImages,
